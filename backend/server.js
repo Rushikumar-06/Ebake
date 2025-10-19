@@ -39,16 +39,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// Database connection with timeout configuration
+// Database connection with proper configuration
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/ebake', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
   serverSelectionTimeoutMS: 30000, // 30 seconds
   socketTimeoutMS: 45000, // 45 seconds
   connectTimeoutMS: 30000, // 30 seconds
   maxPoolSize: 10, // Maintain up to 10 socket connections
-  bufferMaxEntries: 0, // Disable mongoose buffering
-  bufferCommands: false, // Disable mongoose buffering
+  // Keep default buffering behavior to avoid connection issues
 })
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));
@@ -61,7 +58,11 @@ app.use('/api/admin', require('./routes/admin'));
 
 // Health check route
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Ebake API is running' });
+  res.json({ 
+    status: 'OK', 
+    message: 'Ebake API is running',
+    dbStatus: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+  });
 });
 
 // Error handling middleware
