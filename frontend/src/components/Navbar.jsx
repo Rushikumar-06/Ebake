@@ -209,13 +209,15 @@ const Navbar = () => {
                   >
                     Profile
                   </Link>
-                  <Link 
-                    to="/orders" 
-                    className="px-3 py-2 text-sm text-gray-700"
-                    onClick={() => setIsMenuOpen(false)}
-                  >
-                    My Orders
-                  </Link>
+                  {!isAdmin() && (
+                    <Link 
+                      to="/orders" 
+                      className="px-3 py-2 text-sm text-gray-700"
+                      onClick={() => setIsMenuOpen(false)}
+                    >
+                      My Orders
+                    </Link>
+                  )}
                   {user?.role === 'admin' && (
                     <Link 
                       to="/admin" 
