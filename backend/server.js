@@ -28,10 +28,27 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Database connection
+// Request timeout middleware (30 seconds)
+app.use((req, res, next) => {
+  req.setTimeout(30000, () => {
+    res.status(504).json({
+      success: false,
+      message: 'Request timeout - please try again'
+    });
+  });
+  next();
+});
+
+// Database connection with timeout configuration
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/ebake', {
   useNewUrlParser: true,
   useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 30000, // 30 seconds
+  socketTimeoutMS: 45000, // 45 seconds
+  connectTimeoutMS: 30000, // 30 seconds
+  maxPoolSize: 10, // Maintain up to 10 socket connections
+  bufferMaxEntries: 0, // Disable mongoose buffering
+  bufferCommands: false, // Disable mongoose buffering
 })
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));

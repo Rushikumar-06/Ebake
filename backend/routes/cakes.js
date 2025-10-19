@@ -25,9 +25,21 @@ router.get('/', optionalAuth, async (req, res) => {
     const filter = { isAvailable: true };
     const flavorConditions = [];
 
-    // Search filter
+    // Search filter - use regex search for better compatibility
     if (search) {
-      filter.$text = { $search: search };
+      const searchConditions = [
+        { name: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { flavor: { $regex: search, $options: 'i' } }
+      ];
+      
+      // If we already have flavor conditions, merge them properly
+      if (filter.$or) {
+        filter.$and = [filter.$or, { $or: searchConditions }];
+        delete filter.$or;
+      } else {
+        filter.$or = searchConditions;
+      }
     }
 
     // Flavor filter - search in both single flavor and flavors array
@@ -62,23 +74,37 @@ router.get('/', optionalAuth, async (req, res) => {
     // Calculate pagination
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Get cakes with pagination
-    const cakes = await Cake.find(filter)
-      .sort(sortConfig)
-      .skip(skip)
-      .limit(parseInt(limit));
+    // Execute queries in parallel for better performance
+    const [cakes, totalCakes] = await Promise.all([
+      Cake.find(filter)
+        .sort(sortConfig)
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean() // Use lean() for better performance when not modifying documents
+        .exec(),
+      Cake.countDocuments(filter)
+    ]);
 
-    // Get total count for pagination
-    const totalCakes = await Cake.countDocuments(filter);
     const totalPages = Math.ceil(totalCakes / parseInt(limit));
 
-    // Get available flavors for filter options - include both single flavor and flavors array
-    const singleFlavors = await Cake.distinct('flavor', { isAvailable: true });
-    const flavorDocs = await Cake.find({ isAvailable: true, flavors: { $exists: true, $not: { $size: 0 } } }, { flavors: 1 });
-    const arrayFlavors = [...new Set(flavorDocs.flatMap(doc => doc.flavors))];
-    const availableFlavors = [...new Set([...singleFlavors, ...arrayFlavors])].filter(Boolean);
+    // Only fetch filter options if no search/filter is applied (to avoid unnecessary queries)
+    let availableFlavors = [];
+    let availableCategories = [];
     
-    const availableCategories = await Cake.distinct('category', { isAvailable: true });
+    if (!search && !flavor && !minPrice && !maxPrice && !category) {
+      // Fetch filter options in parallel with simplified queries
+      [availableFlavors, availableCategories] = await Promise.all([
+        // Simplified flavor query - just get distinct values
+        Promise.all([
+          Cake.distinct('flavor', { isAvailable: true, flavor: { $exists: true, $ne: null } }),
+          Cake.find({ isAvailable: true, flavors: { $exists: true, $not: { $size: 0 } } }, { flavors: 1 }).lean()
+        ]).then(([singleFlavors, flavorDocs]) => {
+          const arrayFlavors = [...new Set(flavorDocs.flatMap(doc => doc.flavors || []))];
+          return [...new Set([...singleFlavors, ...arrayFlavors])].filter(Boolean);
+        }),
+        Cake.distinct('category', { isAvailable: true })
+      ]);
+    }
 
     res.json({
       success: true,
@@ -99,9 +125,26 @@ router.get('/', optionalAuth, async (req, res) => {
     });
   } catch (error) {
     console.error('Get cakes error:', error);
+    
+    // Handle specific error types
+    if (error.name === 'MongoTimeoutError' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        success: false,
+        message: 'Request timeout - please try again'
+      });
+    }
+    
+    if (error.name === 'MongoNetworkError') {
+      return res.status(503).json({
+        success: false,
+        message: 'Database connection error - please try again'
+      });
+    }
+    
     res.status(500).json({
       success: false,
-      message: 'Error fetching cakes'
+      message: 'Error fetching cakes',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
