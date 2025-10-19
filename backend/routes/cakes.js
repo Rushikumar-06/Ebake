@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Cake = require('../models/Cake');
 const { authenticateToken, requireAdmin, optionalAuth } = require('../middleware/auth');
 const { validateCake } = require('../middleware/validation');
@@ -9,6 +10,15 @@ const router = express.Router();
 // Get all cakes with filtering, searching, and pagination
 router.get('/', optionalAuth, async (req, res) => {
   try {
+    // Check database connection first
+    if (mongoose.connection.readyState !== 1) {
+      console.error('Database not connected, readyState:', mongoose.connection.readyState);
+      return res.status(503).json({
+        success: false,
+        message: 'Database connection not ready. Please try again.'
+      });
+    }
+
     const {
       page = 1,
       limit = 12,
@@ -21,19 +31,26 @@ router.get('/', optionalAuth, async (req, res) => {
       sortOrder = 'desc'
     } = req.query;
 
+    // Validate and sanitize input parameters
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(50, Math.max(1, parseInt(limit) || 12)); // Cap at 50 for performance
+    const skip = (pageNum - 1) * limitNum;
+
     // Build filter object
     const filter = { isAvailable: true };
     const flavorConditions = [];
 
     // Search filter - use regex search for better compatibility
-    if (search) {
+    if (search && typeof search === 'string' && search.trim()) {
+      // Escape special regex characters to prevent injection
+      const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const searchConditions = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-        { flavor: { $regex: search, $options: 'i' } }
+        { name: { $regex: escapedSearch, $options: 'i' } },
+        { description: { $regex: escapedSearch, $options: 'i' } },
+        { flavor: { $regex: escapedSearch, $options: 'i' } }
       ];
       
-      // If we already have flavor conditions, merge them properly
+      // Handle existing conditions properly
       if (filter.$or) {
         filter.$and = [filter.$or, { $or: searchConditions }];
         delete filter.$or;
@@ -43,67 +60,99 @@ router.get('/', optionalAuth, async (req, res) => {
     }
 
     // Flavor filter - search in both single flavor and flavors array
-    if (flavor) {
+    if (flavor && typeof flavor === 'string' && flavor.trim()) {
+      const escapedFlavor = flavor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       flavorConditions.push(
-        { flavor: { $regex: flavor, $options: 'i' } },
-        { flavors: { $in: [new RegExp(flavor, 'i')] } }
+        { flavor: { $regex: escapedFlavor, $options: 'i' } },
+        { flavors: { $in: [new RegExp(escapedFlavor, 'i')] } }
       );
     }
 
-    // Price range filter
+    // Price range filter with validation
     if (minPrice || maxPrice) {
       filter.price = {};
-      if (minPrice) filter.price.$gte = parseFloat(minPrice);
-      if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
+      const minPriceVal = parseFloat(minPrice);
+      const maxPriceVal = parseFloat(maxPrice);
+      
+      if (minPrice && !isNaN(minPriceVal) && minPriceVal >= 0) {
+        filter.price.$gte = minPriceVal;
+      }
+      if (maxPrice && !isNaN(maxPriceVal) && maxPriceVal >= 0) {
+        filter.price.$lte = maxPriceVal;
+      }
+      
+      // Remove price filter if no valid values
+      if (Object.keys(filter.price).length === 0) {
+        delete filter.price;
+      }
     }
 
     // Category filter
-    if (category) {
-      filter.category = category;
+    if (category && typeof category === 'string' && category.trim()) {
+      filter.category = category.trim();
     }
 
-    // Sort configuration
+    // Sort configuration with validation
+    const allowedSortFields = ['createdAt', 'name', 'price', 'category'];
+    const validSortBy = allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
     const sortConfig = {};
-    sortConfig[sortBy] = sortOrder === 'asc' ? 1 : -1;
+    sortConfig[validSortBy] = sortOrder === 'asc' ? 1 : -1;
 
     // Apply flavor conditions to filter
     if (flavorConditions.length > 0) {
-      filter.$or = flavorConditions;
+      if (filter.$or) {
+        filter.$and = filter.$and || [];
+        filter.$and.push({ $or: flavorConditions });
+      } else {
+        filter.$or = flavorConditions;
+      }
     }
-
-    // Calculate pagination
-    const skip = (parseInt(page) - 1) * parseInt(limit);
 
     // Execute queries in parallel for better performance
     const [cakes, totalCakes] = await Promise.all([
       Cake.find(filter)
         .sort(sortConfig)
         .skip(skip)
-        .limit(parseInt(limit))
+        .limit(limitNum)
         .lean() // Use lean() for better performance when not modifying documents
-        .exec(),
+        .exec()
+        .catch(err => {
+          console.error('Cake.find error:', err);
+          throw err;
+        }),
       Cake.countDocuments(filter)
+        .catch(err => {
+          console.error('Cake.countDocuments error:', err);
+          throw err;
+        })
     ]);
 
-    const totalPages = Math.ceil(totalCakes / parseInt(limit));
+    const totalPages = Math.ceil(totalCakes / limitNum);
 
     // Only fetch filter options if no search/filter is applied (to avoid unnecessary queries)
     let availableFlavors = [];
     let availableCategories = [];
     
     if (!search && !flavor && !minPrice && !maxPrice && !category) {
-      // Fetch filter options in parallel with simplified queries
-      [availableFlavors, availableCategories] = await Promise.all([
-        // Simplified flavor query - just get distinct values
-        Promise.all([
-          Cake.distinct('flavor', { isAvailable: true, flavor: { $exists: true, $ne: null } }),
-          Cake.find({ isAvailable: true, flavors: { $exists: true, $not: { $size: 0 } } }, { flavors: 1 }).lean()
-        ]).then(([singleFlavors, flavorDocs]) => {
-          const arrayFlavors = [...new Set(flavorDocs.flatMap(doc => doc.flavors || []))];
-          return [...new Set([...singleFlavors, ...arrayFlavors])].filter(Boolean);
-        }),
-        Cake.distinct('category', { isAvailable: true })
-      ]);
+      try {
+        // Fetch filter options in parallel with simplified queries
+        [availableFlavors, availableCategories] = await Promise.all([
+          // Simplified flavor query - just get distinct values
+          Promise.all([
+            Cake.distinct('flavor', { isAvailable: true, flavor: { $exists: true, $ne: null } }),
+            Cake.find({ isAvailable: true, flavors: { $exists: true, $not: { $size: 0 } } }, { flavors: 1 }).lean()
+          ]).then(([singleFlavors, flavorDocs]) => {
+            const arrayFlavors = [...new Set(flavorDocs.flatMap(doc => doc.flavors || []))];
+            return [...new Set([...singleFlavors, ...arrayFlavors])].filter(Boolean);
+          }),
+          Cake.distinct('category', { isAvailable: true })
+        ]);
+      } catch (filterError) {
+        console.error('Error loading filter options:', filterError);
+        // Continue without filter options rather than failing the whole request
+        availableFlavors = [];
+        availableCategories = [];
+      }
     }
 
     res.json({
@@ -111,11 +160,11 @@ router.get('/', optionalAuth, async (req, res) => {
       data: {
         cakes,
         pagination: {
-          currentPage: parseInt(page),
+          currentPage: pageNum,
           totalPages,
           totalCakes,
-          hasNext: parseInt(page) < totalPages,
-          hasPrev: parseInt(page) > 1
+          hasNext: pageNum < totalPages,
+          hasPrev: pageNum > 1
         },
         filters: {
           availableFlavors,
@@ -125,6 +174,12 @@ router.get('/', optionalAuth, async (req, res) => {
     });
   } catch (error) {
     console.error('Get cakes error:', error);
+    console.error('Error details:', {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      code: error.code
+    });
     
     // Handle specific error types
     if (error.name === 'MongoTimeoutError' || error.message.includes('timeout')) {
@@ -140,11 +195,23 @@ router.get('/', optionalAuth, async (req, res) => {
         message: 'Database connection error - please try again'
       });
     }
+
+    if (error.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid query parameters'
+      });
+    }
     
+    // Always log the error for debugging, but only send safe message to client
     res.status(500).json({
       success: false,
       message: 'Error fetching cakes',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      // Include error details in production for debugging (can be removed later)
+      ...(process.env.NODE_ENV !== 'development' && { 
+        error: error.message,
+        code: error.code || error.name
+      })
     });
   }
 });
